@@ -411,6 +411,7 @@ func (sm *SystemSettingsManager) DisplaySystemConfig(settings types.SystemSettin
 	logrus.Infof("    Max Retries: %d", settings.MaxRetries)
 	logrus.Infof("    Blacklist Threshold: %d", settings.BlacklistThreshold)
 	logrus.Infof("    Key Validation Interval: %d minutes", settings.KeyValidationIntervalMinutes)
+	logrus.Infof("    Key Rotation Interval: %d minutes", settings.KeyRotationIntervalMinutes)
 	logrus.Info("====================================")
 	logrus.Info("")
 }

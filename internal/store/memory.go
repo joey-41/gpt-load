@@ -223,16 +223,9 @@ func (s *MemoryStore) LPush(key string, values ...any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var list []string
-	rawList, exists := s.data[key]
-	if !exists {
-		list = make([]string, 0)
-	} else {
-		var ok bool
-		list, ok = rawList.([]string)
-		if !ok {
-			return fmt.Errorf("type mismatch: key '%s' holds a different data type", key)
-		}
+	list, err := s.getListLocked(key)
+	if err != nil {
+		return err
 	}
 
 	strValues := make([]string, len(values))
@@ -241,6 +234,24 @@ func (s *MemoryStore) LPush(key string, values ...any) error {
 	}
 
 	s.data[key] = append(strValues, list...) // Prepend
+	return nil
+}
+
+func (s *MemoryStore) RPush(key string, values ...any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	list, err := s.getListLocked(key)
+	if err != nil {
+		return err
+	}
+
+	strValues := make([]string, len(values))
+	for i, v := range values {
+		strValues[i] = fmt.Sprint(v)
+	}
+
+	s.data[key] = append(list, strValues...)
 	return nil
 }
 
@@ -278,14 +289,9 @@ func (s *MemoryStore) Rotate(key string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rawList, exists := s.data[key]
-	if !exists {
-		return "", ErrNotFound
-	}
-
-	list, ok := rawList.([]string)
-	if !ok {
-		return "", fmt.Errorf("type mismatch: key '%s' holds a different data type", key)
+	list, err := s.getExistingListLocked(key)
+	if err != nil {
+		return "", err
 	}
 
 	if len(list) == 0 {
@@ -300,6 +306,41 @@ func (s *MemoryStore) Rotate(key string) (string, error) {
 	s.data[key] = newList
 
 	return item, nil
+}
+
+func (s *MemoryStore) SelectRotatingKey(listKey, stateKey string, intervalSeconds int64, nowUnix int64, forceRotate bool) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	list, err := s.getExistingListLocked(listKey)
+	if err != nil {
+		return "", err
+	}
+	if len(list) == 0 {
+		return "", ErrNotFound
+	}
+
+	if !forceRotate && intervalSeconds > 0 {
+		state, err := s.getHashLocked(stateKey, false)
+		if err != nil {
+			return "", err
+		}
+		currentKeyID := state["current_key_id"]
+		rotatedAt, _ := strconv.ParseInt(state["rotated_at"], 10, 64)
+		if currentKeyID != "" && rotatedAt > 0 && nowUnix-rotatedAt < intervalSeconds && s.listContains(list, currentKeyID) {
+			return currentKeyID, nil
+		}
+	}
+
+	lastIndex := len(list) - 1
+	selectedKeyID := list[lastIndex]
+	s.data[listKey] = append([]string{selectedKeyID}, list[:lastIndex]...)
+	s.data[stateKey] = map[string]string{
+		"current_key_id": selectedKeyID,
+		"rotated_at":     strconv.FormatInt(nowUnix, 10),
+	}
+
+	return selectedKeyID, nil
 }
 
 // LLen returns the length of a list.
@@ -318,6 +359,59 @@ func (s *MemoryStore) LLen(key string) (int64, error) {
 	}
 
 	return int64(len(list)), nil
+}
+
+func (s *MemoryStore) getListLocked(key string) ([]string, error) {
+	rawList, exists := s.data[key]
+	if !exists {
+		return make([]string, 0), nil
+	}
+
+	list, ok := rawList.([]string)
+	if !ok {
+		return nil, fmt.Errorf("type mismatch: key '%s' holds a different data type", key)
+	}
+
+	return list, nil
+}
+
+func (s *MemoryStore) getExistingListLocked(key string) ([]string, error) {
+	list, err := s.getListLocked(key)
+	if err != nil {
+		return nil, err
+	}
+	if len(list) == 0 {
+		return nil, ErrNotFound
+	}
+	return list, nil
+}
+
+func (s *MemoryStore) getHashLocked(key string, create bool) (map[string]string, error) {
+	rawHash, exists := s.data[key]
+	if !exists {
+		if !create {
+			return map[string]string{}, nil
+		}
+		hash := make(map[string]string)
+		s.data[key] = hash
+		return hash, nil
+	}
+
+	hash, ok := rawHash.(map[string]string)
+	if !ok {
+		return nil, fmt.Errorf("type mismatch: key '%s' holds a different data type", key)
+	}
+
+	return hash, nil
+}
+
+func (s *MemoryStore) listContains(list []string, target string) bool {
+	for _, item := range list {
+		if item == target {
+			return true
+		}
+	}
+	return false
 }
 
 // --- SET operations ---

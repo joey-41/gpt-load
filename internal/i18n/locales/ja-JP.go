@@ -171,6 +171,8 @@ var MessagesJaJP = map[string]string{
 	"config.key_validation_concurrency_desc": "バックグラウンドで無効なキーを検証する際の並行数。SQLiteや低性能環境では20以下を維持し、データ不整合を回避してください。",
 	"config.key_validation_timeout":          "キー検証タイムアウト（秒）",
 	"config.key_validation_timeout_desc":     "バックグラウンドで単一キーを検証する際のAPIリクエストタイムアウト（秒）。",
+	"config.key_rotation_interval":           "キー切り替え間隔（分）",
+	"config.key_rotation_interval_desc":      "現在のキーを次のキーへ切り替えるまで固定で使い続ける時間（分）。0 にするとリクエストごとに切り替えます。現在のキーが失敗した場合は即座に次のキーへ切り替えます。",
 
 	// Category labels
 	"config.category.basic":   "基本設定",

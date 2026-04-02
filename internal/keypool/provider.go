@@ -24,6 +24,12 @@ type KeyProvider struct {
 	encryptionSvc   encryption.Service
 }
 
+type rotationStateSnapshot struct {
+	currentKeyID string
+	rotatedAt    int64
+	exists       bool
+}
+
 // NewProvider 创建一个新的 KeyProvider 实例。
 func NewProvider(db *gorm.DB, store store.Store, settingsManager *config.SystemSettingsManager, encryptionSvc encryption.Service) *KeyProvider {
 	return &KeyProvider{
@@ -34,17 +40,26 @@ func NewProvider(db *gorm.DB, store store.Store, settingsManager *config.SystemS
 	}
 }
 
-// SelectKey 为指定的分组原子性地选择并轮换一个可用的 APIKey。
-func (p *KeyProvider) SelectKey(groupID uint) (*models.APIKey, error) {
+// SelectKey 为指定的分组选择一个可用的 APIKey。
+// rotationIntervalMinutes: 轮循间隔时间（分钟），0表示每次请求都轮循
+// forceRotate: 是否强制轮循（如 key 失败后的重试场景）
+func (p *KeyProvider) SelectKey(groupID uint, rotationIntervalMinutes int, forceRotate bool) (*models.APIKey, error) {
 	activeKeysListKey := fmt.Sprintf("group:%d:active_keys", groupID)
+	rotationStateKey := p.rotationStateKey(groupID)
+	intervalSeconds := int64(rotationIntervalMinutes) * 60
+	nowUnix := time.Now().Unix()
 
-	// 1. Atomically rotate the key ID from the list
-	keyIDStr, err := p.store.Rotate(activeKeysListKey)
+	beforeState, err := p.getRotationState(rotationStateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read rotation state for group %d: %w", groupID, err)
+	}
+
+	keyIDStr, err := p.store.SelectRotatingKey(activeKeysListKey, rotationStateKey, intervalSeconds, nowUnix, forceRotate)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, app_errors.ErrNoActiveKeys
 		}
-		return nil, fmt.Errorf("failed to rotate key from store: %w", err)
+		return nil, fmt.Errorf("failed to select rotating key from store: %w", err)
 	}
 
 	keyID, err := strconv.ParseUint(keyIDStr, 10, 64)
@@ -52,14 +67,25 @@ func (p *KeyProvider) SelectKey(groupID uint) (*models.APIKey, error) {
 		return nil, fmt.Errorf("failed to parse key ID '%s': %w", keyIDStr, err)
 	}
 
-	// 2. Get key details from HASH
+	logrus.WithFields(logrus.Fields{
+		"groupID":     groupID,
+		"interval":    rotationIntervalMinutes,
+		"forceRotate": forceRotate,
+		"selectedKey": keyID,
+		"decision":    determineRotationDecision(beforeState, keyIDStr, intervalSeconds, nowUnix, forceRotate),
+	}).Debug("Selected key for group")
+
+	return p.getKeyDetails(keyID, groupID)
+}
+
+// getKeyDetails 从 HASH 获取 key 详情并构建 APIKey 对象。
+func (p *KeyProvider) getKeyDetails(keyID uint64, groupID uint) (*models.APIKey, error) {
 	keyHashKey := fmt.Sprintf("key:%d", keyID)
 	keyDetails, err := p.store.HGetAll(keyHashKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get key details for key ID %d: %w", keyID, err)
 	}
 
-	// 3. Manually unmarshal the map into an APIKey struct
 	failureCount, _ := strconv.ParseInt(keyDetails["failure_count"], 10, 64)
 	createdAt, _ := strconv.ParseInt(keyDetails["created_at"], 10, 64)
 
@@ -174,10 +200,10 @@ func (p *KeyProvider) handleSuccess(keyID uint, keyHashKey, activeKeysListKey st
 		if !isActive {
 			logrus.WithField("keyID", keyID).Debug("Key has recovered and is being restored to active pool.")
 			if err := p.store.LRem(activeKeysListKey, 0, keyID); err != nil {
-				return fmt.Errorf("failed to LRem key before LPush on recovery: %w", err)
+				return fmt.Errorf("failed to LRem key before RPush on recovery: %w", err)
 			}
-			if err := p.store.LPush(activeKeysListKey, keyID); err != nil {
-				return fmt.Errorf("failed to LPush key back to active list: %w", err)
+			if err := p.store.RPush(activeKeysListKey, keyID); err != nil {
+				return fmt.Errorf("failed to RPush key back to active list: %w", err)
 			}
 		}
 
@@ -230,6 +256,10 @@ func (p *KeyProvider) handleFailure(apiKey *models.APIKey, group *models.Group, 
 			if err := p.store.HSet(keyHashKey, map[string]any{"status": models.KeyStatusInvalid}); err != nil {
 				return fmt.Errorf("failed to update key status to invalid in store: %w", err)
 			}
+		}
+
+		if err := p.clearRotationStateIfCurrent(group.ID, apiKey.ID); err != nil {
+			return fmt.Errorf("failed to clear rotation state for key %d: %w", apiKey.ID, err)
 		}
 
 		return nil
@@ -287,9 +317,11 @@ func (p *KeyProvider) LoadKeysFromDB() error {
 	for groupID, activeIDs := range allActiveKeyIDs {
 		if len(activeIDs) > 0 {
 			activeKeysListKey := fmt.Sprintf("group:%d:active_keys", groupID)
+			rotationStateKey := p.rotationStateKey(groupID)
 			p.store.Delete(activeKeysListKey)
-			if err := p.store.LPush(activeKeysListKey, activeIDs...); err != nil {
-				logrus.WithFields(logrus.Fields{"groupID": groupID, "error": err}).Error("Failed to LPush active keys for group")
+			p.store.Delete(rotationStateKey)
+			if err := p.store.RPush(activeKeysListKey, activeIDs...); err != nil {
+				logrus.WithFields(logrus.Fields{"groupID": groupID, "error": err}).Error("Failed to RPush active keys for group")
 			}
 		}
 	}
@@ -521,6 +553,7 @@ func (p *KeyProvider) RemoveKeysFromStore(groupID uint, keyIDs []uint) error {
 	}
 
 	activeKeysListKey := fmt.Sprintf("group:%d:active_keys", groupID)
+	rotationStateKey := p.rotationStateKey(groupID)
 
 	// 第一步：直接删除整个 active_keys 列表
 	if err := p.store.Delete(activeKeysListKey); err != nil {
@@ -528,6 +561,13 @@ func (p *KeyProvider) RemoveKeysFromStore(groupID uint, keyIDs []uint) error {
 			"groupID": groupID,
 			"error":   err,
 		}).Error("Failed to delete active keys list")
+		return err
+	}
+	if err := p.store.Delete(rotationStateKey); err != nil {
+		logrus.WithFields(logrus.Fields{
+			"groupID": groupID,
+			"error":   err,
+		}).Error("Failed to delete rotation state")
 		return err
 	}
 
@@ -563,10 +603,10 @@ func (p *KeyProvider) addKeyToStore(key *models.APIKey) error {
 	if key.Status == models.KeyStatusActive {
 		activeKeysListKey := fmt.Sprintf("group:%d:active_keys", key.GroupID)
 		if err := p.store.LRem(activeKeysListKey, 0, key.ID); err != nil {
-			return fmt.Errorf("failed to LRem key %d before LPush for group %d: %w", key.ID, key.GroupID, err)
+			return fmt.Errorf("failed to LRem key %d before RPush for group %d: %w", key.ID, key.GroupID, err)
 		}
-		if err := p.store.LPush(activeKeysListKey, key.ID); err != nil {
-			return fmt.Errorf("failed to LPush key %d to group %d: %w", key.ID, key.GroupID, err)
+		if err := p.store.RPush(activeKeysListKey, key.ID); err != nil {
+			return fmt.Errorf("failed to RPush key %d to group %d: %w", key.ID, key.GroupID, err)
 		}
 	}
 	return nil
@@ -606,9 +646,9 @@ func (p *KeyProvider) addKeysToCacheBatch(groupID uint, keys []models.APIKey) er
 		activeKeyIDs[i] = keys[i].ID
 	}
 
-	// 3. 批量 LPush 活跃密钥
-	if err := p.store.LPush(activeKeysListKey, activeKeyIDs...); err != nil {
-		return fmt.Errorf("failed to batch LPush keys to group %d: %w", groupID, err)
+	// 3. 批量 RPush 活跃密钥
+	if err := p.store.RPush(activeKeysListKey, activeKeyIDs...); err != nil {
+		return fmt.Errorf("failed to batch RPush keys to group %d: %w", groupID, err)
 	}
 
 	return nil
@@ -619,6 +659,9 @@ func (p *KeyProvider) removeKeyFromStore(keyID, groupID uint) error {
 	activeKeysListKey := fmt.Sprintf("group:%d:active_keys", groupID)
 	if err := p.store.LRem(activeKeysListKey, 0, keyID); err != nil {
 		logrus.WithFields(logrus.Fields{"keyID": keyID, "groupID": groupID, "error": err}).Error("Failed to LRem key from active list")
+	}
+	if err := p.clearRotationStateIfCurrent(groupID, keyID); err != nil {
+		return fmt.Errorf("failed to clear rotation state for group %d: %w", groupID, err)
 	}
 
 	keyHashKey := fmt.Sprintf("key:%d", keyID)
@@ -647,4 +690,52 @@ func pluckIDs(keys []models.APIKey) []uint {
 		ids[i] = key.ID
 	}
 	return ids
+}
+
+func (p *KeyProvider) rotationStateKey(groupID uint) string {
+	return fmt.Sprintf("group:%d:rotation_state", groupID)
+}
+
+func (p *KeyProvider) getRotationState(stateKey string) (rotationStateSnapshot, error) {
+	state, err := p.store.HGetAll(stateKey)
+	if err != nil {
+		return rotationStateSnapshot{}, err
+	}
+
+	snapshot := rotationStateSnapshot{
+		currentKeyID: state["current_key_id"],
+		exists:       state["current_key_id"] != "" || state["rotated_at"] != "",
+	}
+	if snapshot.exists {
+		snapshot.rotatedAt, _ = strconv.ParseInt(state["rotated_at"], 10, 64)
+	}
+
+	return snapshot, nil
+}
+
+func (p *KeyProvider) clearRotationStateIfCurrent(groupID, keyID uint) error {
+	state, err := p.getRotationState(p.rotationStateKey(groupID))
+	if err != nil {
+		return err
+	}
+	if state.currentKeyID == "" || state.currentKeyID != fmt.Sprint(keyID) {
+		return nil
+	}
+	return p.store.Delete(p.rotationStateKey(groupID))
+}
+
+func determineRotationDecision(beforeState rotationStateSnapshot, selectedKeyID string, intervalSeconds int64, nowUnix int64, forceRotate bool) string {
+	if forceRotate {
+		return "force_rotate"
+	}
+	if intervalSeconds <= 0 {
+		return "rotate"
+	}
+	if beforeState.exists && beforeState.currentKeyID == selectedKeyID && beforeState.rotatedAt > 0 && nowUnix-beforeState.rotatedAt < intervalSeconds {
+		return "reuse"
+	}
+	if beforeState.exists && beforeState.currentKeyID != "" && beforeState.currentKeyID != selectedKeyID && beforeState.rotatedAt > 0 && nowUnix-beforeState.rotatedAt < intervalSeconds {
+		return "state_reset"
+	}
+	return "rotate"
 }

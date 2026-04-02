@@ -18,6 +18,41 @@ type RedisStore struct {
 	client *redis.Client
 }
 
+const rotationNotFoundSentinel = "__ROTATION_NOT_FOUND__"
+
+var selectRotatingKeyScript = redis.NewScript(`
+local listKey = KEYS[1]
+local stateKey = KEYS[2]
+local interval = tonumber(ARGV[1])
+local now = tonumber(ARGV[2])
+local forceRotate = ARGV[3] == "1"
+
+if redis.call("LLEN", listKey) == 0 then
+	return "` + rotationNotFoundSentinel + `"
+end
+
+if (not forceRotate) and interval > 0 then
+	local currentKeyID = redis.call("HGET", stateKey, "current_key_id")
+	local rotatedAt = tonumber(redis.call("HGET", stateKey, "rotated_at") or "0")
+	if currentKeyID and rotatedAt > 0 and (now - rotatedAt) < interval then
+		local allKeys = redis.call("LRANGE", listKey, 0, -1)
+		for _, keyID in ipairs(allKeys) do
+			if keyID == currentKeyID then
+				return currentKeyID
+			end
+		end
+	end
+end
+
+local selectedKeyID = redis.call("RPOPLPUSH", listKey, listKey)
+if not selectedKeyID then
+	return "` + rotationNotFoundSentinel + `"
+end
+
+redis.call("HSET", stateKey, "current_key_id", selectedKeyID, "rotated_at", tostring(now))
+return selectedKeyID
+`)
+
 // NewRedisStore creates a new RedisStore instance.
 func NewRedisStore(client *redis.Client) *RedisStore {
 	return &RedisStore{client: client}
@@ -106,6 +141,10 @@ func (s *RedisStore) LPush(key string, values ...any) error {
 	return s.client.LPush(context.Background(), s.prefixKey(key), values...).Err()
 }
 
+func (s *RedisStore) RPush(key string, values ...any) error {
+	return s.client.RPush(context.Background(), s.prefixKey(key), values...).Err()
+}
+
 func (s *RedisStore) LRem(key string, count int64, value any) error {
 	return s.client.LRem(context.Background(), s.prefixKey(key), count, value).Err()
 }
@@ -125,6 +164,33 @@ func (s *RedisStore) Rotate(key string) (string, error) {
 // LLen returns the length of a list.
 func (s *RedisStore) LLen(key string) (int64, error) {
 	return s.client.LLen(context.Background(), s.prefixKey(key)).Result()
+}
+
+func (s *RedisStore) SelectRotatingKey(listKey, stateKey string, intervalSeconds int64, nowUnix int64, forceRotate bool) (string, error) {
+	forceRotateArg := "0"
+	if forceRotate {
+		forceRotateArg = "1"
+	}
+
+	result, err := selectRotatingKeyScript.Run(
+		context.Background(),
+		s.client,
+		[]string{s.prefixKey(listKey), s.prefixKey(stateKey)},
+		intervalSeconds,
+		nowUnix,
+		forceRotateArg,
+	).Text()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	if result == rotationNotFoundSentinel {
+		return "", ErrNotFound
+	}
+
+	return result, nil
 }
 
 // --- SET operations ---

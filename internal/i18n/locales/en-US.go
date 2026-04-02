@@ -171,6 +171,8 @@ var MessagesEnUS = map[string]string{
 	"config.key_validation_concurrency_desc": "Concurrency level for background invalid key validation. Keep below 20 for SQLite or low-performance environments to avoid data consistency issues.",
 	"config.key_validation_timeout":          "Key Validation Timeout (seconds)",
 	"config.key_validation_timeout_desc":     "API request timeout (seconds) when validating a single key in the background.",
+	"config.key_rotation_interval":           "Key Rotation Interval (minutes)",
+	"config.key_rotation_interval_desc":      "How many minutes to keep using the current key before rotating to the next one. Set to 0 for per-request rotation. If the current key fails, GPT-Load will rotate immediately.",
 
 	// Category labels
 	"config.category.basic":   "Basic",

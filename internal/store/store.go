@@ -47,9 +47,11 @@ type Store interface {
 
 	// LIST operations
 	LPush(key string, values ...any) error
+	RPush(key string, values ...any) error
 	LRem(key string, count int64, value any) error
 	Rotate(key string) (string, error)
 	LLen(key string) (int64, error)
+	SelectRotatingKey(listKey, stateKey string, intervalSeconds int64, nowUnix int64, forceRotate bool) (string, error)
 
 	// SET operations
 	SAdd(key string, members ...any) error

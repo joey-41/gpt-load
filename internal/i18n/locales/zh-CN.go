@@ -171,6 +171,8 @@ var MessagesZhCN = map[string]string{
 	"config.key_validation_concurrency_desc": "后台定时验证无效 Key 时的并发数，如果使用SQLite或者运行环境性能不佳，请尽量保证20以下，避免过高的并发导致数据不一致问题。",
 	"config.key_validation_timeout":          "密钥验证超时（秒）",
 	"config.key_validation_timeout_desc":     "后台定时验证单个 Key 时的 API 请求超时时间（秒）。",
+	"config.key_rotation_interval":           "Key 轮循间隔（分钟）",
+	"config.key_rotation_interval_desc":      "当前 Key 轮循后，继续固定使用多少分钟再切换到下一个 Key。设置为 0 表示每次请求都轮循；如果当前 Key 报错，则会立即轮循到下一个 Key。",
 
 	// Category labels
 	"config.category.basic":   "基础参数",
